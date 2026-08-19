@@ -24,12 +24,128 @@ jobs:
       - name: Fetch upstream
         run: git fetch upstream --tags
 
-      - name: Merge upstream/main into main
+      - name: Generate sync log
+        id: sync_log
+        run: |
+          # 获取上次同步的标记
+          LAST_SYNC_MARKER=$(git log --oneline --grep="Sync from OpenMinis" -1 2>/dev/null | head -1 || echo "")
+          
+          if [ -z "$LAST_SYNC_MARKER" ]; then
+            # 首次同步，使用仓库最早提交作为基准
+            BASE_COMMIT=$(git rev-list --max-parents=0 HEAD 2>/dev/null || echo "HEAD~100")
+          else
+            # 使用上次同步点作为基准
+            BASE_COMMIT="$LAST_SYNC_MARKER"
+          fi
+          
+          # 获取 upstream 的最新提交
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          
+          # 检查是否有差异
+          DIFF_COUNT=$(git rev-list --count "$BASE_COMMIT".."$UPSTREAM_HEAD" 2>/dev/null || echo "0")
+          
+          if [ "$DIFF_COUNT" -eq "0" ]; then
+            echo "No new commits to sync"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # 生成详细的同步日志
+          SYNC_TIME=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          
+          # 创建日志文件
+          cat > SYNC_LOG.md << 'SYNCLOG'
+# 同步记录
+SYNCLOG
+          
+          cat >> SYNC_LOG.md << SYNCLOG
+## 同步信息
+
+- **同步时间**: $SYNC_TIME
+- **上游仓库**: https://github.com/OpenMinis/OpenMinis
+- **同步范围**: 上次同步 → 当前 upstream/main
+- **新增提交**: $DIFF_COUNT 个
+SYNCLOG
+          
+          cat >> SYNC_LOG.md << SYNCLOG
+
+## 更新内容
+
+SYNCLOG
+          
+          # 添加详细的提交记录
+          git log --oneline --format="### %s%n%b" "$BASE_COMMIT".."$UPSTREAM_HEAD" >> SYNC_LOG.md 2>/dev/null || \
+          git log --oneline "$BASE_COMMIT".."$UPSTREAM_HEAD" >> SYNC_LOG.md 2>/dev/null
+          
+          # 添加文件变更统计
+          cat >> SYNC_LOG.md << SYNCLOG
+
+## 文件变更统计
+
+\`\`\`
+$(git diff --stat "$BASE_COMMIT" "$UPSTREAM_HEAD" 2>/dev/null || echo "无法获取统计信息")
+\`\`\`
+SYNCLOG
+          
+          # 添加变更文件列表
+          cat >> SYNC_LOG.md << SYNCLOG
+
+## 变更文件列表
+
+\`\`\`
+$(git diff --name-only "$BASE_COMMIT" "$UPSTREAM_HEAD" 2>/dev/null | head -50 || echo "无变更文件")
+SYNCLOG
+          
+          echo "sync_log_content<<EOF" >> $GITHUB_OUTPUT
+          cat SYNC_LOG.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          echo "new_commits=$DIFF_COUNT" >> $GITHUB_OUTPUT
+          echo "upstream_sha=$UPSTREAM_HEAD" >> $GITHUB_OUTPUT
+
+      - name: Merge upstream into main
+        if: steps.sync_log.outputs.has_changes == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout main
-          git merge upstream/main --no-edit --allow-unrelated-histories || echo "No new changes to merge"
+          git merge upstream/main --no-edit --allow-unrelated-histories
 
-      - name: Push changes
-        run: git push origin main --tags
+      - name: Commit sync log
+        if: steps.sync_log.outputs.has_changes == 'true'
+        run: |
+          git add SYNC_LOG.md
+          git commit -m "🔄 Sync from OpenMinis
+
+          Sync time: $(date '+%Y-%m-%d %H:%M:%S UTC')
+          New commits: ${{ steps.sync_log.outputs.new_commits }}
+          Upstream SHA: ${{ steps.sync_log.outputs.upstream_sha }}
+
+          $(head -20 SYNC_LOG.md | tail -n +4)" || echo "No changes to commit"
+          git push origin main
+
+      - name: Push tags
+        if: steps.sync_log.outputs.has_changes == 'true'
+        run: git push origin --tags
+
+      - name: Post summary
+        if: steps.sync_log.outputs.has_changes == 'true'
+        run: |
+          echo "## 同步完成 ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "同步时间: ${{ steps.sync_log.outputs.new_commits }} 个新提交" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          head -30 SYNC_LOG.md >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[查看完整同步日志](../../blob/main/SYNC_LOG.md)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Skip sync (no changes)
+        if: steps.sync_log.outputs.has_changes == 'false'
+        run: |
+          echo "## 同步完成 ✅" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "没有新更新，跳过同步" >> $GITHUB_STEP_SUMMARY
+        env:
+          GITHUB_STEP_SUMMARY: $GITHUB_STEP_SUMMARY
