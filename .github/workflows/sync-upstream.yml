@@ -1,0 +1,35 @@
+name: Sync Upstream (OpenMinis/OpenMinis)
+
+on:
+  schedule:
+    # 每6小时同步一次：0:00, 6:00, 12:00, 18:00 (UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/OpenMinis/OpenMinis.git
+
+      - name: Fetch upstream
+        run: git fetch upstream --tags
+
+      - name: Merge upstream/main into main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git merge upstream/main --no-edit --allow-unrelated-histories || echo "No new changes to merge"
+
+      - name: Push changes
+        run: git push origin main --tags
