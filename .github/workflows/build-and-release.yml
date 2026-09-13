@@ -1,0 +1,438 @@
+# 构建与发布工作流
+# 从 CI 构建日志重建 - hf805864818/deepseek-ai
+# 源: hf805864818/deepseek-ai/.github/workflows/build-and-release.yml@refs/heads/main
+
+name: Build and Release
+
+# 触发器: 推送到 main 分支时触发, 支持手动触发
+# [skip ci] 提交信息用于避免 prepare 步骤的版本提交导致递归触发
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 全局权限: 内容写入(用于提交版本号), 元数据读取
+permissions:
+  contents: write
+  metadata: read
+
+jobs:
+  # ============================================================
+  # Job 1: 准备版本号和变更日志
+  # 运行在 ubuntu-latest, 递增版本号并提交到仓库
+  # ============================================================
+  prepare:
+    name: Prepare Version & Changelog
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤 1: 检出代码 (完整历史, 用于版本号和变更日志)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          repository: hf805864818/deepseek-ai
+
+      # 步骤 2: 递增版本号 (iOS 版本, build 号, Android 版本号和 code)
+      - name: Increment version numbers
+        id: version
+        run: |
+          chmod +x scripts/increment-version.sh
+          bash scripts/increment-version.sh
+          VERSION=$(head -1 VERSION.txt)
+          BUILD=$(grep '^build=' VERSION.txt | cut -d= -f2)
+          ANDROID_CODE=$(grep '^android_code=' VERSION.txt | cut -d= -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+          echo "android_code=$ANDROID_CODE" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION (Build: $BUILD, Android Code: $ANDROID_CODE)"
+
+      # 步骤 3: 生成变更日志 (基于 git 历史和标签)
+      - name: Generate changelog
+        id: changelog
+        run: |
+          chmod +x scripts/generate-changelog.sh
+          CHANGELOG=$(bash scripts/generate-changelog.sh "${{ steps.version.outputs.version }}")
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # 步骤 4: 提交版本号变更并推送到仓库
+      - name: Commit version bump
+        run: |
+          git config user.name "Build Bot"
+          git config user.email "bot@deepseek-ai.local"
+          git add -A
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          # Pull with rebase before push to handle concurrent commits
+          # (e.g. direct pushes to main during the prepare step)
+          git pull --rebase origin main
+          git push
+
+  # ============================================================
+  # Job 2: 构建 iOS IPA (TrollStore 兼容, 未签名)
+  # 运行在 macos-latest, 构建 LAME/FFmpeg/rclone/iSH/Alpine rootfs
+  # ============================================================
+  build-ios:
+    name: Build iOS IPA (TrollStore)
+    needs: prepare
+    runs-on: macos-latest
+
+    steps:
+      # 步骤 1: 检出代码 (递归子模块, 浅克隆)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          repository: hf805864818/deepseek-ai
+
+      # 步骤 2: 设置原生依赖缓存 (LAME/FFmpeg/iSH 构建产物)
+      - name: Setup cache for native deps
+        id: cache-native-deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            # Final outputs (used by Xcode)
+            deps/frameworks
+            deps/libs
+            deps/include
+            deps/resources
+            # Intermediate build dirs (faster incremental builds)
+            deps/lame-build
+            deps/ffmpeg-6.1.2/build-ios
+            deps/ish/build-ios
+            # Downloaded source (skip re-download)
+            deps/ffmpeg-6.1.2
+          key: ios-native-deps-macOS-${{ hashFiles('deps/**/*.sh', 'deps/**/*.c', 'deps/**/*.h') }}
+          restore-keys: |
+            ios-native-deps-macOS-
+
+      # 步骤 3: 检查缓存状态 (决定是否跳过完整重建)
+      - name: Cache status
+        run: |
+          if [ "${{ steps.cache-native-deps.outputs.cache-hit }}" = "true" ]; then
+            echo "✅ Native deps cache HIT - skipping full rebuild"
+          else
+            echo "⚠️  Native deps cache MISS - will do full build"
+          fi
+
+      # 步骤 4: 安装构建依赖 (ninja, llvm, libarchive, pkg-config, meson, lld, ldid)
+      - name: Install build dependencies
+        run: brew install ninja llvm libarchive pkg-config meson lld ldid
+
+      # 步骤 5: 准备 Xcode 配置 (从示例文件创建 xcconfig)
+      - name: Prepare Xcode config
+        run: |
+          if [ -f src/ios/Configs/ProviderCustomization.xcconfig.example ] && [ ! -f src/ios/Configs/ProviderCustomization.xcconfig ]; then
+            cp src/ios/Configs/ProviderCustomization.xcconfig.example src/ios/Configs/ProviderCustomization.xcconfig
+            echo "Created ProviderCustomization.xcconfig from example"
+          fi
+
+      # 步骤 6: 构建 LAME (MP3 编码器静态库, iOS arm64)
+      - name: Build LAME
+        run: ./deps/build_lame.sh
+
+      # 步骤 7: 构建 FFmpeg (多媒体库, iOS arm64)
+      - name: Build FFmpeg
+        run: ./deps/build_ffmpeg.sh
+
+      # 步骤 8: 安装 Go 工具链 (用于构建 rclone iOS)
+      - name: Install Go toolchain (for rclone)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.23
+
+      # 步骤 9: 缓存 Go 构建产物 (模块缓存和编译缓存)
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-rclone-ios-macOS-${{ hashFiles('deps/build_rclone*.sh') }}
+          restore-keys: |
+            go-rclone-ios-macOS-
+
+      # 步骤 10: 构建 rclone iOS (Rclone.xcframework, 设备和模拟器)
+      - name: Build rclone iOS (Rclone.xcframework)
+        run: ./deps/build_rclone_ios.sh
+
+      # 步骤 11: 构建 iSH (Linux 模拟器静态库, iOS arm64)
+      - name: Build iSH
+        run: ./deps/build_ish.sh
+
+      # 步骤 12: 准备 Alpine rootfs (aarch64 fakefs 格式, 用于 iSH)
+      - name: Prepare Alpine rootfs
+        run: ./deps/prepare_alpine_rootfs.sh
+
+      # 步骤 13: 构建 IPA (未签名, TrollStore 兼容)
+      # 使用 xcodebuild 构建后注入 entitlements 并打包为 IPA
+      - name: Build IPA (unsigned, TrollStore compatible)
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          APP_BUILD: ${{ needs.prepare.outputs.build }}
+        run: |
+          cd src/ios
+
+          # Build with version override (fixes version mismatch between Release tag and app binary)
+          xcodebuild -project Minis.xcodeproj -scheme Minis \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath ./DerivedData \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="$APP_BUILD" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          # Find the .app bundle
+          app_path=$(find ./DerivedData -name "*.app" -type d | head -1)
+          echo "Found app at: $app_path"
+          app_name=$(basename "$app_path" .app)
+          binary_path="$app_path/$app_name"
+
+          # Update CFBundleDisplayName in Info.plist to 龙虾Ai
+          # (in case it's generated and not from our Info.plist)
+          plist_path="$app_path/Info.plist"
+          if [ -f "$plist_path" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 龙虾Ai" "$plist_path" 2>/dev/null || true
+          fi
+
+          # Function: inject entitlements into a binary
+          inject_entitlements() {
+            local binary="$1"
+            local entitlements_file="$2"
+            local label="$3"
+            if [ -f "$entitlements_file" ] && [ -f "$binary" ]; then
+              echo "Injecting entitlements for $label..."
+              ldid -S"$entitlements_file" "$binary"
+              echo "  Done. Verifying:"
+              ldid -e "$binary" 2>&1 | head -20
+              echo "  ---"
+            else
+              echo "WARNING: Skipping $label - entitlements or binary not found"
+              [ -f "$entitlements_file" ] || echo "  Missing: $entitlements_file"
+              [ -f "$binary" ] || echo "  Missing: $binary"
+            fi
+          }
+
+          # Inject main app entitlements
+          inject_entitlements "$binary_path" "Minis.entitlements" "Main App ($app_name)"
+
+          # Function: inject entitlements into an app extension
+          inject_appex_entitlements() {
+            local appex_path="$1"
+            local entitlements_file="$2"
+            local label="$3"
+            if [ ! -d "$appex_path" ]; then
+              echo "WARNING: $label appex not found at $appex_path"
+              return
+            fi
+            # Read the binary name from Info.plist
+            local binary_name=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$appex_path/Info.plist" 2>/dev/null)
+            if [ -z "$binary_name" ]; then
+              echo "WARNING: Could not read CFBundleExecutable for $label"
+              return
+            fi
+            local binary="$appex_path/$binary_name"
+            inject_entitlements "$binary" "$entitlements_file" "$label"
+          }
+
+          # Inject app extension entitlements
+          plugins_dir="$app_path/PlugIns"
+          if [ -d "$plugins_dir" ]; then
+            echo "Found PlugIns directory, processing app extensions..."
+
+            # Share Extension
+            inject_appex_entitlements "$plugins_dir/MinisShare.appex" "ShareExtension/ShareExtension.entitlements" "Share Extension"
+
+            # File Provider Extension
+            inject_appex_entitlements "$plugins_dir/MinisFileProvider.appex" "FileProvider/FileProvider.entitlements" "File Provider Extension"
+
+            # Agent Widget Extension
+            inject_appex_entitlements "$plugins_dir/AgentWidgetExtension.appex" "AgentWidget/AgentWidget.entitlements" "Agent Widget Extension"
+          else
+            echo "No PlugIns directory found - skipping extension entitlements injection"
+          fi
+
+          echo "All entitlements injection complete."
+
+          # Package as IPA (rename to 龙虾Ai + version)
+          mkdir -p Payload
+          cp -r "$app_path" Payload/
+          IPA_NAME="龙虾Ai-v${APP_VERSION}.ipa"
+          zip -r -q "$IPA_NAME" Payload
+          echo "IPA created: $(ls -lh "$IPA_NAME")"
+
+      # 步骤 14: 上传 IPA 构建产物
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 龙虾Ai-ipa
+          path: src/ios/龙虾Ai-v${{ needs.prepare.outputs.version }}.ipa
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 3: 构建 Android APK
+  # 运行在 ubuntu-latest, 构建 PRoot/rclone Android/Alpine sandbox
+  # ============================================================
+  build-android:
+    name: Build Android APK
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤 1: 检出代码 (递归子模块, 浅克隆)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+          repository: hf805864818/deepseek-ai
+
+      # 步骤 2: 设置原生依赖缓存 (PRoot 构建产物)
+      - name: Setup cache for native deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/build/proot-android
+            src/android/app/src/main/assets/proot-aarch64
+          key: android-native-deps-Linux-${{ hashFiles('deps/build_proot.sh') }}
+          restore-keys: |
+            android-native-deps-Linux-
+
+      # 步骤 3: 设置 Gradle 缓存 (Gradle 依赖和 wrapper)
+      - name: Setup Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: android-gradle-${{ hashFiles('src/android/**/*.gradle*', 'src/android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            android-gradle-
+
+      # 步骤 4: 安装 Java JDK 17 (Temurin 发行版)
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 步骤 5: 设置 Android SDK (命令行工具, platform-tools)
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
+          cmdline-tools-version: 12266719
+          packages: tools platform-tools
+
+      # 步骤 6: 构建 PRoot (aarch64 Android 二进制, 用于 Linux 模拟)
+      - name: Build PRoot
+        run: ./deps/build_proot.sh
+
+      # 步骤 7: 安装 Go 工具链 (用于构建 rclone Android)
+      - name: Install Go toolchain (for rclone Android)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.23
+
+      # 步骤 8: 缓存 Go 构建产物 (模块缓存和编译缓存)
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-rclone-android-Linux-${{ hashFiles('deps/build_rclone*.sh') }}
+          restore-keys: |
+            go-rclone-android-Linux-
+
+      # 步骤 9: 构建 rclone Android (rclone.aar, gomobile 绑定)
+      - name: Build rclone Android (rclone.aar)
+        run: |
+          # 1. 安装 gomobile (Android 端 rclone 构建依赖)
+          go install golang.org/x/mobile/cmd/gomobile@latest || {
+            echo "::warning::gomobile install failed, skipping rclone Android"
+            exit 0
+          }
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          gomobile init 2>&1 || echo "::warning::gomobile init failed, continuing"
+          # 2. 定位 NDK
+          NDK_DIR=""
+          for base in "$HOME/Android/Sdk" /usr/local/lib/android/sdk "${ANDROID_HOME}"; do
+            [ -d "$base/ndk" ] && NDK_DIR="$(ls -d "$base"/ndk/* 2>/dev/null | head -1)" && break
+          done
+          if [ -z "$NDK_DIR" ]; then
+            echo "NDK not found, skipping rclone Android build (rclone.aar will be missing)"
+            exit 0
+          fi
+          export ANDROID_NDK_HOME="$NDK_DIR"
+          export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          ./deps/build_rclone_android.sh || {
+            echo "::warning::rclone Android build failed, APK will lack rclone support"
+            exit 0
+          }
+
+      # 步骤 10: 准备 Android sandbox (下载 Alpine rootfs, 确认 PRoot 二进制)
+      - name: Prepare Android sandbox
+        run: |
+          chmod +x scripts/prepare_android_sandbox.sh
+          bash scripts/prepare_android_sandbox.sh
+
+      # 步骤 11: 解码发布签名密钥库 (从 base64 secret 还原 keystore)
+      - name: Decode release keystore
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ${{ github.workspace }}/${{ secrets.ANDROID_KEYSTORE_NAME }}-release.keystore
+          echo "Keystore decoded: $(ls -lh ${{ github.workspace }}/${{ secrets.ANDROID_KEYSTORE_NAME }}-release.keystore)"
+
+      # 步骤 12: 构建 APK (Gradle assembleRelease, 签名, 重命名)
+      - name: Build APK
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.version }}
+          APP_ANDROID_CODE: ${{ needs.prepare.outputs.android_code }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/${{ secrets.ANDROID_KEYSTORE_NAME }}-release.keystore
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd src/android
+
+          # Override version in build.gradle.kts (fixes version mismatch)
+          sed -i "s/versionCode = .*/versionCode = $APP_ANDROID_CODE/" app/build.gradle.kts
+          sed -i "s/versionName = .*/versionName = \"$APP_VERSION\"/" app/build.gradle.kts
+          echo "Android version set to $APP_VERSION (code: $APP_ANDROID_CODE)"
+
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon
+
+          # Rename APK to include app name and version
+          # The output filename depends on signing config: signed builds produce
+          # app-release.apk, unsigned builds produce app-release-unsigned.apk
+          APK_DST="app/build/outputs/apk/release/龙虾Ai-v${APP_VERSION}.apk"
+          for SRC in \
+            "app/build/outputs/apk/release/app-release.apk" \
+            "app/build/outputs/apk/release/app-release-unsigned.apk"; do
+            if [ -f "$SRC" ]; then
+              mv "$SRC" "$APK_DST"
+              echo "APK renamed to: $(ls -lh "$APK_DST")"
+              break
+            fi
+          done
+          if [ ! -f "$APK_DST" ]; then
+            echo "ERROR: No APK file found to rename"
+            ls -la app/build/outputs/apk/release/
+            exit 1
+          fi
+
+      # 步骤 13: 上传 APK 构建产物
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 龙虾Ai-apk
+          path: src/android/app/build/outputs/apk/release/龙虾Ai-v${{ needs.prepare.outputs.version }}.apk
+          retention-days: 30
+          if-no-files-found: warn

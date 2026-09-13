@@ -65,10 +65,28 @@ jobs:
           git checkout main
           git merge upstream/main --no-edit --allow-unrelated-histories
 
+      - name: Restore fork-specific files
+        if: steps.sync_log.outputs.has_changes == 'true'
+        run: |
+          # 上游仓库没有这些文件, 合并后需要恢复 fork 专属文件
+          # 1. 恢复构建 workflow (build-and-release.yml)
+          if [ ! -f .github/workflows/build-and-release.yml ]; then
+            echo "Restoring build-and-release.yml (deleted by upstream merge)"
+            git checkout HEAD~1 -- .github/workflows/build-and-release.yml 2>/dev/null || \
+              echo "WARNING: Could not restore build-and-release.yml from previous commit"
+          fi
+          # 2. 创建 Terminal 目录 (pbxproj 中引用为 PBXFileSystemSynchronizedRootGroup)
+          if [ ! -d src/ios/Terminal ]; then
+            echo "Creating src/ios/Terminal directory (referenced in pbxproj)"
+            mkdir -p src/ios/Terminal
+            # 添加 .gitkeep 以便 git 能跟踪空目录
+            touch src/ios/Terminal/.gitkeep
+          fi
+
       - name: Commit sync log
         if: steps.sync_log.outputs.has_changes == 'true'
         run: |
-          git add SYNC_LOG.md
+          git add SYNC_LOG.md .github/workflows/build-and-release.yml src/ios/Terminal/.gitkeep 2>/dev/null || true
           git commit -m "Sync from OpenMinis
 
           Sync time: $(date '+%Y-%m-%d %H:%M:%S UTC')
